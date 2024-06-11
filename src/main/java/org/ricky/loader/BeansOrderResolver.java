@@ -2,11 +2,11 @@ package org.ricky.loader;
 
 import java.util.*;
 
-public class DependencySolver {
+public class BeansOrderResolver {
 
   private Map<String, List<String>> dependents = new HashMap<>();
 
-  public DependencySolver(Map<String, List<String>> dependents) {
+  public BeansOrderResolver(Map<String, List<String>> dependents) {
     this.dependents = dependents;
   }
 

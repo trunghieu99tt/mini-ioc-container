@@ -6,8 +6,14 @@ import org.reflections.Reflections;
 import org.ricky.annotation.Autowired;
 import org.ricky.annotation.Component;
 import org.ricky.annotation.PostConstruct;
+import org.ricky.loader.dependencygetter.ConstructorBasedDependencyGetter;
+import org.ricky.loader.dependencygetter.DependencyGetter;
+import org.ricky.loader.dependencygetter.FieldBasedDependencyGetter;
+import org.ricky.loader.dependencygetter.SetterBasedDependencyGetter;
 
-import java.lang.reflect.*;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.*;
 
 @Log4j2
@@ -15,6 +21,11 @@ public class ContextLoader {
 
   private static final ContextLoader INSTANCE = new ContextLoader();
   private final Map<Class<?>, Object> beans = new HashMap<>();
+  private final List<DependencyGetter> dependencyGetters = List.of(
+      new ConstructorBasedDependencyGetter(),
+      new FieldBasedDependencyGetter(),
+      new SetterBasedDependencyGetter()
+  );
   private List<String> beanNames = new ArrayList<>();
 
   private ContextLoader() {
@@ -24,26 +35,13 @@ public class ContextLoader {
     return INSTANCE;
   }
 
-  private static void invokePostInitiate(Object instance) {
-    var postMethods = Arrays.stream(instance.getClass().getDeclaredMethods())
-        .filter(
-            method -> Arrays.stream(method.getDeclaredAnnotations())
-                .anyMatch(a -> a.annotationType() == PostConstruct.class)
-        )
-        .toList();
-    if (postMethods.isEmpty()) {
-      return;
+
+  @SuppressWarnings("unchecked")
+  public <T> T getBean(Class<T> interfaceType) {
+    if (beans.containsKey(interfaceType)) {
+      return (T) beans.get(interfaceType);
     }
-    if (postMethods.size() > 1) {
-      throw new RuntimeException("Cannot have more than 1 post initiate method");
-    }
-    try {
-      var method = postMethods.get(0);
-      method.setAccessible(true);
-      method.invoke(instance);
-    } catch (Exception e) {
-      throw new RuntimeException(e);
-    }
+    throw new RuntimeException("No bean registered for type: " + interfaceType);
   }
 
   public synchronized void load(String scanPackage) {
@@ -55,8 +53,8 @@ public class ContextLoader {
       List<String> beanDependencies = getDependencies(clazz);
       objWithDependencies.put(clazz.getName(), beanDependencies);
     });
-    final DependencySolver dependencySolver = new DependencySolver(objWithDependencies);
-    final Pair<List<String>, List<List<String>>> resolverResponse = dependencySolver.resolve();
+    final BeansOrderResolver beansOrderResolver = new BeansOrderResolver(objWithDependencies);
+    final Pair<List<String>, List<List<String>>> resolverResponse = beansOrderResolver.resolve();
     final List<String> serviceInitializationOrder = resolverResponse.getFirst();
     final List<List<String>> circulars = resolverResponse.getSecond();
 
@@ -74,24 +72,11 @@ public class ContextLoader {
             if (nullableClazz.isEmpty()) {
               return;
             }
-
             final Class<?> clazz = nullableClazz.get();
-            Optional<Constructor<?>> nullableAutowiredConstructor = getConstructorWithInject(clazz);
-            final Object instance;
-            if (nullableAutowiredConstructor.isEmpty()) {
-              instance = Class.forName(clazz.getName()).getDeclaredConstructor().newInstance();
-            } else {
-              Constructor<?> constructor = nullableAutowiredConstructor.get();
-              var parameterTypes = constructor.getParameterTypes();
-              Object[] dependencies = new Object[parameterTypes.length];
-              for (int i = 0; i < parameterTypes.length; i++) {
-                dependencies[i] = getBean(parameterTypes[i]);
-              }
-              instance = constructor.newInstance(dependencies);
-            }
+            final Object instance = initBeanInstance(clazz);
 
-            injectFieldValue(instance);
-            injectDepsViaMethod(instance);
+            injectFieldBasedDependency(instance);
+            injectSetterBasedDependencies(instance);
             invokePostInitiate(instance);
             beans.put(clazz, instance);
           } catch (Exception ex) {
@@ -101,62 +86,25 @@ public class ContextLoader {
     );
   }
 
-  private List<String> getDependencies(final Class<?> clazz) {
-    final List<String> dependencies = new ArrayList<>();
-    dependencies.addAll(getDependenciesFromConstructor(clazz));
-    dependencies.addAll(getDependenciesFromFieldBasedInjection(clazz));
-    dependencies.addAll(getDependenciesFromMethodBased(clazz));
-    return dependencies;
-  }
-
-  private List<String> getDependenciesFromConstructor(final Class<?> clazz) {
-    for (Constructor<?> constructor : clazz.getConstructors()) {
-      if (constructor.isAnnotationPresent(Autowired.class)) {
-        return Arrays.stream(constructor.getParameters())
-            .map(Parameter::getName)
-            .filter(beanNames::contains)
-            .toList();
+  private Object initBeanInstance(Class<?> clazz) throws InstantiationException, IllegalAccessException,
+      InvocationTargetException, NoSuchMethodException, ClassNotFoundException {
+    Optional<Constructor<?>> nullableAutowiredConstructor = getConstructorForInjection(clazz);
+    final Object instance;
+    if (nullableAutowiredConstructor.isEmpty()) {
+      instance = Class.forName(clazz.getName()).getDeclaredConstructor().newInstance();
+    } else {
+      Constructor<?> constructor = nullableAutowiredConstructor.get();
+      var parameterTypes = constructor.getParameterTypes();
+      Object[] dependencies = new Object[parameterTypes.length];
+      for (int i = 0; i < parameterTypes.length; i++) {
+        dependencies[i] = getBean(parameterTypes[i]);
       }
+      instance = constructor.newInstance(dependencies);
     }
-
-    return Collections.emptyList();
+    return instance;
   }
 
-
-  private List<String> getDependenciesFromFieldBasedInjection(final Class<?> clazz) {
-    final Field[] fields = clazz.getDeclaredFields();
-    return Arrays.stream(fields)
-        .filter(
-            field -> Arrays.stream(field.getDeclaredAnnotations())
-                .anyMatch(a -> a.annotationType() == Autowired.class)
-        )
-        .map(field -> field.getType().getName())
-        .filter(beanNames::contains)
-        .toList();
-  }
-
-  final List<String> getDependenciesFromMethodBased(final Class<?> clazz) {
-    final Method[] methods = clazz.getDeclaredMethods();
-    return Arrays.stream(methods)
-        .filter(
-            method -> Arrays.stream(method.getDeclaredAnnotations())
-                .anyMatch(a -> a.annotationType() == Autowired.class)
-        )
-        .map(
-            method -> {
-              var parameters = method.getParameters();
-              return Arrays.stream(parameters)
-                  .map(Parameter::getName)
-                  .filter(beanNames::contains)
-                  .toList();
-            }
-        )
-        .flatMap(Collection::stream)
-        .toList();
-  }
-
-
-  private Optional<Constructor<?>> getConstructorWithInject(Class<?> clazz) {
+  private Optional<Constructor<?>> getConstructorForInjection(Class<?> clazz) {
     for (Constructor<?> constructor : clazz.getConstructors()) {
       if (constructor.isAnnotationPresent(Autowired.class)) {
         return Optional.of(constructor);
@@ -166,8 +114,14 @@ public class ContextLoader {
     return Optional.empty();
   }
 
+  private List<String> getDependencies(final Class<?> clazz) {
+    final List<String> dependencies = new ArrayList<>();
+    dependencyGetters.forEach(dependencyGetter -> dependencies.addAll(dependencyGetter.get(clazz, beanNames)));
+    return dependencies;
+  }
 
-  private void injectFieldValue(final Object instance) {
+
+  private void injectFieldBasedDependency(final Object instance) {
     var fields = instance.getClass().getDeclaredFields();
     Arrays.stream(fields)
         .filter(
@@ -188,10 +142,11 @@ public class ContextLoader {
         );
   }
 
-  private void injectDepsViaMethod(final Object instance) throws InvocationTargetException, IllegalAccessException {
+  private void injectSetterBasedDependencies(final Object instance) throws InvocationTargetException,
+      IllegalAccessException {
     final Method[] methods = instance.getClass().getDeclaredMethods();
     for (final Method method : methods) {
-      if (method.getName().startsWith("set") && method.getParameterCount() == 1) {
+      if (isAutowiredSetterMethod(method)) {
         Class<?> parameterType = method.getParameterTypes()[0];
         Object dependency = getBean(parameterType);
         if (dependency != null) {
@@ -201,11 +156,32 @@ public class ContextLoader {
     }
   }
 
-  @SuppressWarnings("unchecked")
-  public <T> T getBean(Class<T> interfaceType) {
-    if (beans.containsKey(interfaceType)) {
-      return (T) beans.get(interfaceType);
+  private boolean isAutowiredSetterMethod(Method method) {
+    return method.getName().startsWith("set")
+        && method.getParameterTypes().length == 1
+        && Arrays.stream(method.getDeclaredAnnotations())
+        .anyMatch(a -> a.annotationType() == Autowired.class);
+  }
+
+  private void invokePostInitiate(Object instance) {
+    var postMethods = Arrays.stream(instance.getClass().getDeclaredMethods())
+        .filter(
+            method -> Arrays.stream(method.getDeclaredAnnotations())
+                .anyMatch(a -> a.annotationType() == PostConstruct.class)
+        )
+        .toList();
+    if (postMethods.isEmpty()) {
+      return;
     }
-    throw new RuntimeException("No bean registered for type: " + interfaceType);
+    if (postMethods.size() > 1) {
+      throw new RuntimeException("Cannot have more than 1 post initiate method");
+    }
+    try {
+      var method = postMethods.get(0);
+      method.setAccessible(true);
+      method.invoke(instance);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 }
